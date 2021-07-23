@@ -1,11 +1,16 @@
 /*
- * Copyright 2016-2020 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2021 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+
+#if defined(__TANDEM) && defined(_SPT_MODEL_)
+# include <spthread.h>
+# include <spt_extensions.h> /* timeval */
+#endif
 
 #include <string.h>
 #include "internal/nelem.h"
@@ -17,9 +22,7 @@
 static int final_renegotiate(SSL *s, unsigned int context, int sent);
 static int init_server_name(SSL *s, unsigned int context);
 static int final_server_name(SSL *s, unsigned int context, int sent);
-#ifndef OPENSSL_NO_EC
 static int final_ec_pt_formats(SSL *s, unsigned int context, int sent);
-#endif
 static int init_session_ticket(SSL *s, unsigned int context);
 #ifndef OPENSSL_NO_OCSP
 static int init_status_request(SSL *s, unsigned int context);
@@ -42,6 +45,7 @@ static int tls_parse_certificate_authorities(SSL *s, PACKET *pkt,
 #ifndef OPENSSL_NO_SRP
 static int init_srp(SSL *s, unsigned int context);
 #endif
+static int init_ec_point_formats(SSL *s, unsigned int context);
 static int init_etm(SSL *s, unsigned int context);
 static int init_ems(SSL *s, unsigned int context);
 static int final_ems(SSL *s, unsigned int context, int sent);
@@ -54,6 +58,7 @@ static int final_sig_algs(SSL *s, unsigned int context, int sent);
 static int final_early_data(SSL *s, unsigned int context, int sent);
 static int final_maxfragmentlen(SSL *s, unsigned int context, int sent);
 static int init_post_handshake_auth(SSL *s, unsigned int context);
+static int final_psk(SSL *s, unsigned int context, int sent);
 
 /* Structure to define a built-in extension */
 typedef struct extensions_definition_st {
@@ -110,8 +115,6 @@ typedef struct extensions_definition_st {
  * messages the extension is relevant to. These flags also specify whether the
  * extension is relevant to a particular protocol or protocol version.
  *
- * TODO(TLS1.3): Make sure we have a test to check the consistency of these
- *
  * NOTE: WebSphere Application Server 7+ cannot handle empty extensions at
  * the end, keep these extensions before signature_algorithm.
  */
@@ -151,19 +154,14 @@ static const EXTENSION_DEFINITION ext_defs[] = {
 #else
     INVALID_EXTENSION,
 #endif
-#ifndef OPENSSL_NO_EC
     {
         TLSEXT_TYPE_ec_point_formats,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
         | SSL_EXT_TLS1_2_AND_BELOW_ONLY,
-        NULL, tls_parse_ctos_ec_pt_formats, tls_parse_stoc_ec_pt_formats,
+        init_ec_point_formats, tls_parse_ctos_ec_pt_formats, tls_parse_stoc_ec_pt_formats,
         tls_construct_stoc_ec_pt_formats, tls_construct_ctos_ec_pt_formats,
         final_ec_pt_formats
     },
-#else
-    INVALID_EXTENSION,
-#endif
-#if !defined(OPENSSL_NO_EC) || !defined(OPENSSL_NO_DH)
     {
         /*
          * "supported_groups" is spread across several specifications.
@@ -197,9 +195,6 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         tls_construct_stoc_supported_groups,
         tls_construct_ctos_supported_groups, NULL
     },
-#else
-    INVALID_EXTENSION,
-#endif
     {
         TLSEXT_TYPE_session_ticket,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
@@ -386,7 +381,7 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_SERVER_HELLO
         | SSL_EXT_TLS_IMPLEMENTATION_ONLY | SSL_EXT_TLS1_3_ONLY,
         NULL, tls_parse_ctos_psk, tls_parse_stoc_psk, tls_construct_stoc_psk,
-        tls_construct_ctos_psk, NULL
+        tls_construct_ctos_psk, final_psk
     }
 };
 
@@ -957,7 +952,8 @@ static int final_server_name(SSL *s, unsigned int context, int sent)
      * context, to avoid the confusing situation of having sess_accept_good
      * exceed sess_accept (zero) for the new context.
      */
-    if (SSL_IS_FIRST_HANDSHAKE(s) && s->ctx != s->session_ctx) {
+    if (SSL_IS_FIRST_HANDSHAKE(s) && s->ctx != s->session_ctx
+            && s->hello_retry_request == SSL_HRR_NONE) {
         tsan_counter(&s->ctx->stats.sess_accept);
         tsan_decr(&s->session_ctx->stats.sess_accept);
     }
@@ -1011,7 +1007,6 @@ static int final_server_name(SSL *s, unsigned int context, int sent)
     }
 }
 
-#ifndef OPENSSL_NO_EC
 static int final_ec_pt_formats(SSL *s, unsigned int context, int sent)
 {
     unsigned long alg_k, alg_a;
@@ -1049,7 +1044,6 @@ static int final_ec_pt_formats(SSL *s, unsigned int context, int sent)
 
     return 1;
 }
-#endif
 
 static int init_session_ticket(SSL *s, unsigned int context)
 {
@@ -1125,6 +1119,7 @@ static int init_sig_algs(SSL *s, unsigned int context)
     /* Clear any signature algorithms extension received */
     OPENSSL_free(s->s3.tmp.peer_sigalgs);
     s->s3.tmp.peer_sigalgs = NULL;
+    s->s3.tmp.peer_sigalgslen = 0;
 
     return 1;
 }
@@ -1134,6 +1129,7 @@ static int init_sig_algs_cert(SSL *s, ossl_unused unsigned int context)
     /* Clear any signature algorithms extension received */
     OPENSSL_free(s->s3.tmp.peer_cert_sigalgs);
     s->s3.tmp.peer_cert_sigalgs = NULL;
+    s->s3.tmp.peer_cert_sigalgslen = 0;
 
     return 1;
 }
@@ -1147,6 +1143,15 @@ static int init_srp(SSL *s, unsigned int context)
     return 1;
 }
 #endif
+
+static int init_ec_point_formats(SSL *s, unsigned int context)
+{
+    OPENSSL_free(s->ext.peer_ecpointformats);
+    s->ext.peer_ecpointformats = NULL;
+    s->ext.peer_ecpointformats_len = 0;
+
+    return 1;
+}
 
 static int init_etm(SSL *s, unsigned int context)
 {
@@ -1446,7 +1451,7 @@ int tls_psk_do_binder(SSL *s, const EVP_MD *md, const unsigned char *msgstart,
 #endif
     const unsigned char *label;
     size_t bindersize, labelsize, hashsize;
-    int hashsizei = EVP_MD_size(md);
+    int hashsizei = EVP_MD_get_size(md);
     int ret = -1;
     int usepskfored = 0;
 
@@ -1580,8 +1585,8 @@ int tls_psk_do_binder(SSL *s, const EVP_MD *md, const unsigned char *msgstart,
         binderout = tmpbinder;
 
     bindersize = hashsize;
-    if (EVP_DigestSignInit_ex(mctx, NULL, EVP_MD_name(md), s->ctx->libctx,
-                              s->ctx->propq, mackey) <= 0
+    if (EVP_DigestSignInit_ex(mctx, NULL, EVP_MD_get0_name(md), s->ctx->libctx,
+                              s->ctx->propq, mackey, NULL) <= 0
             || EVP_DigestSignUpdate(mctx, hash, hashsize) <= 0
             || EVP_DigestSignFinal(mctx, binderout, &bindersize) <= 0
             || bindersize != hashsize) {
@@ -1677,6 +1682,22 @@ static int final_maxfragmentlen(SSL *s, unsigned int context, int sent)
 static int init_post_handshake_auth(SSL *s, ossl_unused unsigned int context)
 {
     s->post_handshake_auth = SSL_PHA_NONE;
+
+    return 1;
+}
+
+/*
+ * If clients offer "pre_shared_key" without a "psk_key_exchange_modes"
+ * extension, servers MUST abort the handshake.
+ */
+static int final_psk(SSL *s, unsigned int context, int sent)
+{
+    if (s->server && sent && s->clienthello != NULL
+            && !s->clienthello->pre_proc_exts[TLSEXT_IDX_psk_kex_modes].present) {
+        SSLfatal(s, TLS13_AD_MISSING_EXTENSION,
+                 SSL_R_MISSING_PSK_KEX_MODES_EXTENSION);
+        return 0;
+    }
 
     return 1;
 }

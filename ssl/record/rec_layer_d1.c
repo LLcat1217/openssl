@@ -1,5 +1,5 @@
 /*
- * Copyright 2005-2020 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2005-2021 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -46,6 +46,9 @@ int DTLS_RECORD_LAYER_new(RECORD_LAYER *rl)
 
 void DTLS_RECORD_LAYER_free(RECORD_LAYER *rl)
 {
+    if (rl->d == NULL)
+        return;
+
     DTLS_RECORD_LAYER_clear(rl);
     pqueue_free(rl->d->unprocessed_rcds.q);
     pqueue_free(rl->d->processed_rcds.q);
@@ -826,14 +829,15 @@ int do_dtls1_write(SSL *s, int type, const unsigned char *buf,
 
     sess = s->session;
 
-    if ((sess == NULL) ||
-        (s->enc_write_ctx == NULL) || (EVP_MD_CTX_md(s->write_hash) == NULL))
+    if ((sess == NULL)
+            || (s->enc_write_ctx == NULL)
+            || (EVP_MD_CTX_get0_md(s->write_hash) == NULL))
         clear = 1;
 
     if (clear)
         mac_size = 0;
     else {
-        mac_size = EVP_MD_CTX_size(s->write_hash);
+        mac_size = EVP_MD_CTX_get_size(s->write_hash);
         if (mac_size < 0) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR,
                      SSL_R_EXCEEDS_MAX_FRAGMENT_SIZE);
@@ -867,9 +871,9 @@ int do_dtls1_write(SSL *s, int type, const unsigned char *buf,
 
     /* Explicit IV length, block ciphers appropriate version flag */
     if (s->enc_write_ctx) {
-        int mode = EVP_CIPHER_CTX_mode(s->enc_write_ctx);
+        int mode = EVP_CIPHER_CTX_get_mode(s->enc_write_ctx);
         if (mode == EVP_CIPH_CBC_MODE) {
-            eivlen = EVP_CIPHER_CTX_iv_length(s->enc_write_ctx);
+            eivlen = EVP_CIPHER_CTX_get_iv_length(s->enc_write_ctx);
             if (eivlen <= 1)
                 eivlen = 0;
         }

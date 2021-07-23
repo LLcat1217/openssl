@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2020 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2016-2021 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -10,10 +10,9 @@
 #include <string.h>
 
 #include "internal/nelem.h"
-#include "internal/cryptlib.h" /* for ossl_sleep() */
 #include "ssltestlib.h"
 #include "../testutil.h"
-#include "e_os.h"
+#include "e_os.h" /* for ossl_sleep() etc. */
 
 #ifdef OPENSSL_SYS_UNIX
 # include <unistd.h>
@@ -685,18 +684,21 @@ static int always_retry_puts(BIO *bio, const char *str)
 }
 
 int create_ssl_ctx_pair(OSSL_LIB_CTX *libctx, const SSL_METHOD *sm,
-const SSL_METHOD *cm,
-                        int min_proto_version, int max_proto_version,
-                        SSL_CTX **sctx, SSL_CTX **cctx, char *certfile,
-                        char *privkeyfile)
+                        const SSL_METHOD *cm, int min_proto_version,
+                        int max_proto_version, SSL_CTX **sctx, SSL_CTX **cctx,
+                        char *certfile, char *privkeyfile)
 {
     SSL_CTX *serverctx = NULL;
     SSL_CTX *clientctx = NULL;
 
-    if (*sctx != NULL)
-        serverctx = *sctx;
-    else if (!TEST_ptr(serverctx = SSL_CTX_new_ex(libctx, NULL, sm)))
-        goto err;
+    if (sctx != NULL) {
+        if (*sctx != NULL)
+            serverctx = *sctx;
+        else if (!TEST_ptr(serverctx = SSL_CTX_new_ex(libctx, NULL, sm))
+            || !TEST_true(SSL_CTX_set_options(serverctx,
+                                              SSL_OP_ALLOW_CLIENT_RENEGOTIATION)))
+            goto err;
+    }
 
     if (cctx != NULL) {
         if (*cctx != NULL)
@@ -705,12 +707,25 @@ const SSL_METHOD *cm,
             goto err;
     }
 
-    if ((min_proto_version > 0
-         && !TEST_true(SSL_CTX_set_min_proto_version(serverctx,
-                                                     min_proto_version)))
-        || (max_proto_version > 0
-            && !TEST_true(SSL_CTX_set_max_proto_version(serverctx,
-                                                        max_proto_version))))
+#if !defined(OPENSSL_NO_TLS1_3) \
+    && defined(OPENSSL_NO_EC) \
+    && defined(OPENSSL_NO_DH)
+    /*
+     * There are no usable built-in TLSv1.3 groups if ec and dh are both
+     * disabled
+     */
+    if (max_proto_version == 0
+            && (sm == TLS_server_method() || cm == TLS_client_method()))
+        max_proto_version = TLS1_2_VERSION;
+#endif
+
+    if (serverctx != NULL
+            && ((min_proto_version > 0
+                 && !TEST_true(SSL_CTX_set_min_proto_version(serverctx,
+                                                            min_proto_version)))
+                || (max_proto_version > 0
+                    && !TEST_true(SSL_CTX_set_max_proto_version(serverctx,
+                                                                max_proto_version)))))
         goto err;
     if (clientctx != NULL
         && ((min_proto_version > 0
@@ -721,7 +736,7 @@ const SSL_METHOD *cm,
                                                             max_proto_version)))))
         goto err;
 
-    if (certfile != NULL && privkeyfile != NULL) {
+    if (serverctx != NULL && certfile != NULL && privkeyfile != NULL) {
         if (!TEST_int_eq(SSL_CTX_use_certificate_file(serverctx, certfile,
                                                       SSL_FILETYPE_PEM), 1)
                 || !TEST_int_eq(SSL_CTX_use_PrivateKey_file(serverctx,
@@ -731,13 +746,14 @@ const SSL_METHOD *cm,
             goto err;
     }
 
-    *sctx = serverctx;
+    if (sctx != NULL)
+        *sctx = serverctx;
     if (cctx != NULL)
         *cctx = clientctx;
     return 1;
 
  err:
-    if (*sctx == NULL)
+    if (sctx != NULL && *sctx == NULL)
         SSL_CTX_free(serverctx);
     if (cctx != NULL && *cctx == NULL)
         SSL_CTX_free(clientctx);
@@ -758,16 +774,13 @@ static int set_nb(int fd)
     return flags;
 }
 
-int create_test_sockets(int *cfd, int *sfd)
+int create_test_sockets(int *cfdp, int *sfdp)
 {
     struct sockaddr_in sin;
     const char *host = "127.0.0.1";
     int cfd_connected = 0, ret = 0;
     socklen_t slen = sizeof(sin);
-    int afd = -1;
-
-    *cfd = -1;
-    *sfd = -1;
+    int afd = -1, cfd = -1, sfd = -1;
 
     memset ((char *) &sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
@@ -786,37 +799,39 @@ int create_test_sockets(int *cfd, int *sfd)
     if (listen(afd, 1) < 0)
         goto out;
 
-    *cfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (*cfd < 0)
+    cfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (cfd < 0)
         goto out;
 
     if (set_nb(afd) == -1)
         goto out;
 
-    while (*sfd == -1 || !cfd_connected ) {
-        *sfd = accept(afd, NULL, 0);
-        if (*sfd == -1 && errno != EAGAIN)
+    while (sfd == -1 || !cfd_connected ) {
+        sfd = accept(afd, NULL, 0);
+        if (sfd == -1 && errno != EAGAIN)
             goto out;
 
-        if (!cfd_connected && connect(*cfd, (struct sockaddr*)&sin, sizeof(sin)) < 0)
+        if (!cfd_connected && connect(cfd, (struct sockaddr*)&sin, sizeof(sin)) < 0)
             goto out;
         else
             cfd_connected = 1;
     }
 
-    if (set_nb(*cfd) == -1 || set_nb(*sfd) == -1)
+    if (set_nb(cfd) == -1 || set_nb(sfd) == -1)
         goto out;
     ret = 1;
+    *cfdp = cfd;
+    *sfdp = sfd;
     goto success;
 
 out:
-        if (*cfd != -1)
-            close(*cfd);
-        if (*sfd != -1)
-            close(*sfd);
+    if (cfd != -1)
+        close(cfd);
+    if (sfd != -1)
+        close(sfd);
 success:
-        if (afd != -1)
-            close(afd);
+    if (afd != -1)
+        close(afd);
     return ret;
 }
 

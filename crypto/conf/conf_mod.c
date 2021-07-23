@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2020 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2002-2021 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -15,12 +15,13 @@
 #include <ctype.h>
 #include <openssl/crypto.h>
 #include "internal/conf.h"
-#include "openssl/conf_api.h"
+#include <openssl/conf_api.h>
 #include "internal/dso.h"
 #include "internal/thread_once.h"
 #include <openssl/x509.h>
 #include <openssl/trace.h>
 #include <openssl/engine.h>
+#include "conf_local.h"
 
 DEFINE_STACK_OF(CONF_MODULE)
 DEFINE_STACK_OF(CONF_IMODULE)
@@ -156,11 +157,6 @@ int CONF_modules_load_file_ex(OSSL_LIB_CTX *libctx, const char *filename,
     CONF *conf = NULL;
     int ret = 0, diagnostics = 0;
 
-    ERR_set_mark();
-    conf = NCONF_new_ex(libctx, NULL);
-    if (conf == NULL)
-        goto err;
-
     if (filename == NULL) {
         file = CONF_get1_default_config_file();
         if (file == NULL)
@@ -168,6 +164,11 @@ int CONF_modules_load_file_ex(OSSL_LIB_CTX *libctx, const char *filename,
     } else {
         file = (char *)filename;
     }
+
+    ERR_set_mark();
+    conf = NCONF_new_ex(libctx, NULL);
+    if (conf == NULL)
+        goto err;
 
     if (NCONF_load(conf, file, NULL) <= 0) {
         if ((flags & CONF_MFLAGS_IGNORE_MISSING_FILE) &&
@@ -485,7 +486,7 @@ int CONF_module_add(const char *name, conf_init_func *ifunc,
         return 0;
 }
 
-void conf_modules_free_int(void)
+void ossl_config_modules_free(void)
 {
     CONF_modules_finish();
     CONF_modules_unload(1);
@@ -539,7 +540,6 @@ void CONF_module_set_usr_data(CONF_MODULE *pmod, void *usr_data)
 }
 
 /* Return default config file name */
-
 char *CONF_get1_default_config_file(void)
 {
     const char *t;

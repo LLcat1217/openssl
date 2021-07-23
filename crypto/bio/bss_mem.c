@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2021 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -26,10 +26,8 @@ static int mem_buf_sync(BIO *h);
 static const BIO_METHOD mem_method = {
     BIO_TYPE_MEM,
     "memory buffer",
-    /* TODO: Convert to new style write function */
     bwrite_conv,
     mem_write,
-    /* TODO: Convert to new style read function */
     bread_conv,
     mem_read,
     mem_puts,
@@ -43,10 +41,8 @@ static const BIO_METHOD mem_method = {
 static const BIO_METHOD secmem_method = {
     BIO_TYPE_MEM,
     "secure memory buffer",
-    /* TODO: Convert to new style write function */
     bwrite_conv,
     mem_write,
-    /* TODO: Convert to new style read function */
     bread_conv,
     mem_read,
     mem_puts,
@@ -91,7 +87,7 @@ BIO *BIO_new_mem_buf(const void *buf, int len)
     size_t sz;
 
     if (buf == NULL) {
-        ERR_raise(ERR_LIB_BIO, BIO_R_NULL_PARAMETER);
+        ERR_raise(ERR_LIB_BIO, ERR_R_PASSED_NULL_PARAMETER);
         return NULL;
     }
     sz = (len < 0) ? strlen(buf) : (size_t)len;
@@ -221,10 +217,6 @@ static int mem_write(BIO *b, const char *in, int inl)
     int blen;
     BIO_BUF_MEM *bbm = (BIO_BUF_MEM *)b->ptr;
 
-    if (in == NULL) {
-        ERR_raise(ERR_LIB_BIO, BIO_R_NULL_PARAMETER);
-        goto end;
-    }
     if (b->flags & BIO_FLAGS_MEM_RDONLY) {
         ERR_raise(ERR_LIB_BIO, BIO_R_WRITE_TO_READ_ONLY_BIO);
         goto end;
@@ -232,6 +224,10 @@ static int mem_write(BIO *b, const char *in, int inl)
     BIO_clear_retry_flags(b);
     if (inl == 0)
         return 0;
+    if (in == NULL) {
+        ERR_raise(ERR_LIB_BIO, ERR_R_PASSED_NULL_PARAMETER);
+        goto end;
+    }
     blen = bbm->readp->length;
     mem_buf_sync(b);
     if (BUF_MEM_grow_clean(bbm->buf, blen + inl) == 0)

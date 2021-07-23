@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2021 The OpenSSL Project Authors. All Rights Reserved.
  * Copyright (c) 2002, Oracle and/or its affiliates. All rights reserved
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
@@ -95,9 +95,8 @@ CERT *ssl_cert_dup(CERT *cert)
         ret->dh_tmp = cert->dh_tmp;
         EVP_PKEY_up_ref(ret->dh_tmp);
     }
-#ifndef OPENSSL_NO_DH
+
     ret->dh_tmp_cb = cert->dh_tmp_cb;
-#endif
     ret->dh_tmp_auto = cert->dh_tmp_auto;
 
     for (i = 0; i < SSL_PKEY_NUM; i++) {
@@ -601,7 +600,8 @@ static int xname_sk_cmp(const X509_NAME *const *a, const X509_NAME *const *b)
 
 static unsigned long xname_hash(const X509_NAME *a)
 {
-    return X509_NAME_hash((X509_NAME *)a);
+    /* This returns 0 also if SHA1 is not available */
+    return X509_NAME_hash_ex((X509_NAME *)a, NULL, NULL, NULL);
 }
 
 STACK_OF(X509_NAME) *SSL_load_client_CA_file_ex(const char *file,
@@ -878,7 +878,7 @@ int ssl_build_cert_chain(SSL *s, SSL_CTX *ctx, int flags)
             untrusted = cpk->chain;
     }
 
-    xs_ctx = X509_STORE_CTX_new_ex(real_ctx->libctx, ctx->propq);
+    xs_ctx = X509_STORE_CTX_new_ex(real_ctx->libctx, real_ctx->propq);
     if (xs_ctx == NULL) {
         ERR_raise(ERR_LIB_SSL, ERR_R_MALLOC_FAILURE);
         goto err;
@@ -960,18 +960,41 @@ int ssl_cert_set_cert_store(CERT *c, X509_STORE *store, int chain, int ref)
     return 1;
 }
 
+int ssl_get_security_level_bits(const SSL *s, const SSL_CTX *ctx, int *levelp)
+{
+    int level;
+    /*
+     * note that there's a corresponding minbits_table
+     * in crypto/x509/x509_vfy.c that's used for checking the security level
+     * of RSA and DSA keys
+     */
+    static const int minbits_table[5 + 1] = { 0, 80, 112, 128, 192, 256 };
+
+    if (ctx != NULL)
+        level = SSL_CTX_get_security_level(ctx);
+    else
+        level = SSL_get_security_level(s);
+
+    if (level > 5)
+        level = 5;
+    else if (level < 0)
+        level = 0;
+
+    if (levelp != NULL)
+        *levelp = level;
+
+    return minbits_table[level];
+}
+
 static int ssl_security_default_callback(const SSL *s, const SSL_CTX *ctx,
                                          int op, int bits, int nid, void *other,
                                          void *ex)
 {
     int level, minbits;
-    static const int minbits_table[5] = { 80, 112, 128, 192, 256 };
-    if (ctx)
-        level = SSL_CTX_get_security_level(ctx);
-    else
-        level = SSL_get_security_level(s);
 
-    if (level <= 0) {
+    minbits = ssl_get_security_level_bits(s, ctx, &level);
+
+    if (level == 0) {
         /*
          * No EDH keys weaker than 1024-bits even at level 0, otherwise,
          * anything goes.
@@ -980,9 +1003,6 @@ static int ssl_security_default_callback(const SSL *s, const SSL_CTX *ctx,
             return 0;
         return 1;
     }
-    if (level > 5)
-        level = 5;
-    minbits = minbits_table[level - 1];
     switch (op) {
     case SSL_SECOP_CIPHER_SUPPORTED:
     case SSL_SECOP_CIPHER_SHARED:
